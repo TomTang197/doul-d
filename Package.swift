@@ -38,6 +38,11 @@ let package = Package(
             path: "Sources/DoulDApp"
         ),
         .testTarget(
+            name: "DolbyDisplayTests",
+            dependencies: ["DolbyDisplay"],
+            path: "Tests/DolbyDisplayTests"
+        ),
+        .testTarget(
             name: "DoulDTests",
             dependencies: ["DolbyCore", "DolbyMetal", "DolbyDisplay"],
             path: "Tests/DoulDTests"
