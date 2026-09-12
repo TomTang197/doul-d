@@ -42,6 +42,7 @@ public final class NSMetalViewHost: NSView {
         layer.device = device
         self.layer = layer
         self.metalLayer = layer
+        self.engine.hostMetalLayer = layer
         updateConfiguration()
     }
     

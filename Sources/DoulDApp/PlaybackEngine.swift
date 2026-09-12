@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AVFoundation
 import CoreMedia
 import CoreVideo
 import Metal
@@ -8,15 +9,23 @@ import DolbyCore
 import DolbyMetal
 import DolbyDisplay
 
-/// 播放与渲染调度核心引擎
+/// 播放与渲染调度核心引擎 (支持真实本地视频硬解与杜比着色器渲染)
 @MainActor
 public final class PlaybackEngine: ObservableObject {
-    // MARK: - Published 状态
+    // MARK: - 媒体文件与播放状态
+    
+    @Published public var loadedMediaURL: URL?
+    @Published public var mediaFileName: String = ""
+    @Published public var isPlaying: Bool = false
+    @Published public var currentPlaybackTime: Double = 0.0
+    @Published public var totalDuration: Double = 0.0
+    @Published public var playbackProgress: Double = 0.0
+    
+    // MARK: - 杜比视界解析状态
     
     @Published public var currentProfile: DolbyVisionProfile = .profile7FEL
     @Published public var isProfile7Rewritten: Bool = true
     @Published public var targetProfile: DolbyVisionProfile = .profile81
-    
     @Published public var videoWidth: Int = 3840
     @Published public var videoHeight: Int = 2160
     @Published public var fps: Double = 23.976
@@ -28,9 +37,6 @@ public final class PlaybackEngine: ObservableObject {
     
     // 渲染模式
     @Published public var renderMode: DVRenderMode = .lldvTunneling
-    @Published public var isPlaying: Bool = false
-    @Published public var currentPlaybackTime: Double = 0.0
-    @Published public var totalDuration: Double = 7200.0 // 示例时长
     
     // 显示器状态
     @Published public var bestExternalDisplay: DisplayEvaluation?
@@ -46,7 +52,14 @@ public final class PlaybackEngine: ObservableObject {
     public let displayCoordinator: ExternalDisplayCoordinator
     private var presentationSession: DolbyPresentationSession?
     
-    private var playbackTimer: Timer?
+    // 真实播放器管线
+    public private(set) var avPlayer: AVPlayer?
+    private var videoOutput: AVPlayerItemVideoOutput?
+    private var renderTimer: Timer?
+    private var timeObserverToken: Any?
+    
+    // 绑定的本地视图 Layer (用于直接送显)
+    public weak var hostMetalLayer: CAMetalLayer?
     
     public init() {
         self.metalRenderer = DVMetalRenderer()
@@ -57,7 +70,191 @@ public final class PlaybackEngine: ObservableObject {
         refreshDisplayTopology()
     }
     
-    // MARK: - 显示器拓扑探测与模式协商
+    // MARK: - 真实本地文件加载与分析
+    
+    /// 加载用户选择或拖入的本地视频文件 (MKV / MP4 / MOV / TS 等)
+    public func loadMediaFile(url: URL) {
+        // 停止之前的播放
+        stopPlayback()
+        
+        self.loadedMediaURL = url
+        self.mediaFileName = url.lastPathComponent
+        appendLog("📂 打开本地文件: \(url.lastPathComponent)")
+        
+        // 1. 初始化 AVPlayerItem 与 10-bit P010 视频输出
+        let asset = AVURLAsset(url: url)
+        let playerItem = AVPlayerItem(asset: asset)
+        
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+        let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: outputSettings)
+        playerItem.add(videoOutput)
+        self.videoOutput = videoOutput
+        
+        let player = AVPlayer(playerItem: playerItem)
+        self.avPlayer = player
+        
+        // 2. 异步解析杜比视界 Track 与色彩描述
+        Task {
+            await inspectMediaTracks(asset: asset)
+        }
+        
+        // 3. 监听播放时间推进
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.currentPlaybackTime = CMTimeGetSeconds(time)
+                if self.totalDuration > 0 {
+                    self.playbackProgress = self.currentPlaybackTime / self.totalDuration
+                }
+            }
+        }
+        
+        // 启动渲染循环
+        startRenderLoop()
+        
+        // 自动开始播放
+        player.play()
+        self.isPlaying = true
+        appendLog("▶️ 开始硬解播放，已接入 Metal 杜比视界渲染管线")
+    }
+    
+    /// 深入检测视频轨道的杜比视界属性
+    private func inspectMediaTracks(asset: AVURLAsset) async {
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let videoTrack = tracks.first else { return }
+            
+            let size = try await videoTrack.load(.naturalSize)
+            let frameRate = try await videoTrack.load(.nominalFrameRate)
+            let duration = try await asset.load(.duration)
+            
+            self.videoWidth = Int(size.width)
+            self.videoHeight = Int(size.height)
+            self.fps = Double(frameRate > 0 ? frameRate : 24.0)
+            self.totalDuration = CMTimeGetSeconds(duration)
+            
+            // 检查 FormatDescriptions 是否包含杜比原子
+            let formatDescriptions = try await videoTrack.load(.formatDescriptions)
+            var detectedProfile: DolbyVisionProfile = .profile7FEL
+            var isDolbyDetected = false
+            
+            for desc in formatDescriptions {
+                if let extensions = CMFormatDescriptionGetExtensions(desc) as? [String: Any] {
+                    // 检查 SampleDescriptionExtensionAtoms (dvcC, dv81, dvvC 等)
+                    if let atoms = extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any] {
+                        if atoms["dvcC"] != nil || atoms["dv81"] != nil || atoms["dvvC"] != nil {
+                            isDolbyDetected = true
+                        }
+                    }
+                    
+                    // 检查色彩空间
+                    if let primaries = extensions[kCVImageBufferColorPrimariesKey as String] as? String {
+                        if primaries.contains("IPT") {
+                            detectedProfile = .profile5
+                            isDolbyDetected = true
+                        }
+                    }
+                }
+            }
+            
+            if isDolbyDetected {
+                appendLog("🎯 识别到杜比视界轨道! 视频分辨率: \(videoWidth)x\(videoHeight) @ \(String(format: "%.2f", fps))fps")
+                loadDemoStream(profile: detectedProfile)
+            } else {
+                appendLog("ℹ️ 检测为标准 HEVC/HDR 视频流，已默认启用 HDR10/EDR 增强管线")
+                loadDemoStream(profile: .profile81)
+            }
+        } catch {
+            appendLog("⚠️ 视频元数据解析提示: \(error.localizedDescription)")
+            self.totalDuration = 7200.0
+        }
+    }
+    
+    // MARK: - 渲染时钟循环
+    
+    private func startRenderLoop() {
+        renderTimer?.invalidate()
+        // 以 60Hz 轮询视频输出缓冲区并提交渲染
+        renderTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.renderCurrentFrame()
+            }
+        }
+    }
+    
+    private func renderCurrentFrame() {
+        guard let player = avPlayer, let output = videoOutput, let renderer = metalRenderer else {
+            return
+        }
+        
+        let currentTime = player.currentTime()
+        if output.hasNewPixelBuffer(forItemTime: currentTime) {
+            if let pixelBuffer = output.copyPixelBuffer(forItemTime: currentTime, itemTimeForDisplay: nil) {
+                // 1. 渲染至当前窗口的 CAMetalLayer
+                if let hostLayer = hostMetalLayer, let drawable = hostLayer.nextDrawable() {
+                    renderer.render(pixelBuffer: pixelBuffer, to: drawable)
+                }
+                
+                // 2. 同步渲染至外接屏幕独立全屏会话
+                if let session = presentationSession, let extDrawable = session.metalLayer.nextDrawable() {
+                    renderer.render(pixelBuffer: pixelBuffer, to: extDrawable)
+                }
+            }
+        }
+    }
+    
+    // MARK: - 播放控制接口
+    
+    public func togglePlayback() {
+        guard let player = avPlayer else {
+            // 如果未加载真实文件，启动模拟器时钟
+            isPlaying.toggle()
+            if isPlaying {
+                appendLog("▶️ 模拟时钟开始运行")
+            } else {
+                appendLog("⏸ 模拟时钟已暂停")
+            }
+            return
+        }
+        
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+            appendLog("⏸ 暂停播放")
+        } else {
+            player.play()
+            isPlaying = true
+            appendLog("▶️ 继续播放")
+        }
+    }
+    
+    public func seek(to progress: Double) {
+        guard let player = avPlayer, totalDuration > 0 else { return }
+        let targetSeconds = progress * totalDuration
+        let targetTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+        player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
+        self.currentPlaybackTime = targetSeconds
+        self.playbackProgress = progress
+    }
+    
+    public func stopPlayback() {
+        renderTimer?.invalidate()
+        renderTimer = nil
+        if let token = timeObserverToken {
+            avPlayer?.removeTimeObserver(token)
+            timeObserverToken = nil
+        }
+        avPlayer?.pause()
+        avPlayer = nil
+        videoOutput = nil
+        isPlaying = false
+    }
+    
+    // MARK: - 模式与投屏
     
     public func refreshDisplayTopology() {
         bestExternalDisplay = displayCoordinator.findBestDisplayForDolbyVision()
@@ -67,28 +264,20 @@ public final class PlaybackEngine: ObservableObject {
             let headroom = best.edrState?.currentHeadroom ?? 1.0
             let peakNits = best.edrState?.estimatedPeakNits ?? 500.0
             
-            appendLog("🔍 发现最佳输出显示设备: \(best.name) (ID: \(best.displayID))")
-            appendLog("   - 杜比视界支持: \(dvDesc)")
-            appendLog("   - 当前 EDR 裕度: \(String(format: "%.2fx", headroom)) (峰值约 \(Int(peakNits)) nits)")
+            appendLog("🔍 发现输出显示设备: \(best.name) (ID: \(best.displayID))")
+            appendLog("   - 杜比支持: \(dvDesc)")
+            appendLog("   - EDR 裕度: \(String(format: "%.2fx", headroom)) (峰值约 \(Int(peakNits)) nits)")
             
-            // 自动匹配推荐模式
             switch best.recommendedMode {
             case .dolbyVisionLLDV, .dolbyVisionStandardTunnel:
                 renderMode = .lldvTunneling
-                appendLog("   -> 推荐启用 LLDV 杜比视界 RGB 隧道封装直通")
-            case .nativeEDR:
-                renderMode = .nativeAppleEDR
-                appendLog("   -> 推荐启用 Apple 原生 EDR 宽动态范围呈现")
             default:
                 renderMode = .nativeAppleEDR
             }
         } else {
-            appendLog("⚠️ 未检测到外接 HDR/杜比显示器，采用内建屏幕 EDR 渲染模式")
             renderMode = .nativeAppleEDR
         }
     }
-    
-    // MARK: - 投屏与独立全屏管理
     
     public func toggleExternalPresentation() {
         if isExternalPresentationActive {
@@ -111,7 +300,6 @@ public final class PlaybackEngine: ObservableObject {
                 device: renderer.device
             )
             
-            // 配置全屏图层
             if renderMode == .lldvTunneling {
                 DVMetalLayerConfig.configureForLLDVTunnel(layer: session.metalLayer)
             } else {
@@ -119,9 +307,9 @@ public final class PlaybackEngine: ObservableObject {
             }
             self.presentationSession = session
             self.isExternalPresentationActive = true
-            appendLog("✅ 外屏独立全屏会话建立成功，已锁定专属渲染管线")
+            appendLog("✅ 外屏已开启独立全屏呈现！(按 Esc 随时退出)")
         } catch {
-            appendLog("❌ 启动外屏全屏失败: \(error.localizedDescription)")
+            appendLog("❌ 启动外屏失败: \(error.localizedDescription)")
         }
     }
     
@@ -129,14 +317,12 @@ public final class PlaybackEngine: ObservableObject {
         presentationSession?.dismiss()
         presentationSession = nil
         isExternalPresentationActive = false
-        appendLog("⏹ 已退出外屏独立全屏呈现")
+        appendLog("⏹ 已退出外屏独立全屏")
     }
-    
-    // MARK: - 模拟/测试片源加载与 Profile 7 重构演示
     
     public func loadDemoStream(profile: DolbyVisionProfile) {
         currentProfile = profile
-        appendLog("🎬 加载杜比视界媒体流: \(profile.description)")
+        appendLog("🎬 配置杜比视界解析策略: \(profile.description)")
         
         switch profile {
         case .profile7, .profile7FEL, .profile7MEL:
@@ -149,7 +335,12 @@ public final class PlaybackEngine: ObservableObject {
             avgLuminanceNits = 240.0
             
         case .profile5:
-            isProfile5Loaded()
+            isProfile7Rewritten = false
+            targetProfile = .profile5
+            appendLog("🌈 流媒体 Profile 5 (IPT) - 启用 Metal 专用 IPTPQc2 逆色彩解算矩阵 (消除偏色发紫)")
+            minLuminanceNits = 0.0001
+            maxLuminanceNits = 1000.0
+            avgLuminanceNits = 180.0
             
         case .profile81, .profile84:
             isProfile7Rewritten = false
@@ -165,49 +356,8 @@ public final class PlaybackEngine: ObservableObject {
         }
     }
     
-    private func isProfile5Loaded() {
-        isProfile7Rewritten = false
-        targetProfile = .profile5
-        appendLog("🌈 流媒体 Profile 5 (IPT 颜色空间) - 启用 Metal 专用 IPTPQc2 逆色彩解算矩阵")
-        appendLog("✅ 消除发紫发绿，映射至 Rec.2020 宽色域")
-        minLuminanceNits = 0.0001
-        maxLuminanceNits = 1000.0
-        avgLuminanceNits = 180.0
-    }
-    
-    public func togglePlayback() {
-        isPlaying.toggle()
-        if isPlaying {
-            startPlaybackTimer()
-            appendLog("▶️ 播放开始")
-        } else {
-            playbackTimer?.invalidate()
-            playbackTimer = nil
-            appendLog("⏸ 播放暂停")
-        }
-    }
-    
-    private func startPlaybackTimer() {
-        playbackTimer?.invalidate()
-        playbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, self.isPlaying else { return }
-                self.currentPlaybackTime += 1.0
-                if self.currentPlaybackTime > self.totalDuration {
-                    self.currentPlaybackTime = 0.0
-                }
-                
-                // 模拟场景动态元数据变化
-                let variation = sin(self.currentPlaybackTime * 0.1) * 200.0
-                self.maxLuminanceNits = max(600.0, min(4000.0, 1000.0 + variation))
-                self.avgLuminanceNits = max(100.0, min(500.0, 200.0 + variation * 0.2))
-            }
-        }
-    }
-    
     private func setupDiagnostics() {
-        appendLog("🚀 Doul D 杜比视界播放引擎初始化完成")
-        appendLog("🔧 Apple Silicon 硬件加速渲染管线就绪 (Metal 3.0)")
+        appendLog("🚀 Doul D 杜比视界引擎初始化就绪")
     }
     
     public func appendLog(_ message: String) {
